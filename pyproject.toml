@@ -1,5 +1,5 @@
 [project]
-name = "grpctunnel"
+name = "grpctunnel-py"
 version = "0.1.0"
 description = "Python port of grpctunnel - carry gRPC over gRPC"
 readme = "README.md"
