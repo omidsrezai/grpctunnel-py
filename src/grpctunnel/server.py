@@ -245,8 +245,11 @@ class TunnelServer:
             write_event.set()
         self.enqueue_write = signaling_enqueue  # type: ignore
 
+        loop_count = 0
         try:
             while not self._is_closing:
+                loop_count += 1
+                print(f"[DEBUG] serve_tunnel loop iteration {loop_count}")
                 # Start a read task if we don't have one
                 if read_task is None:
                     read_coro = stream.read() if hasattr(stream, 'read') else stream.__anext__()
@@ -281,8 +284,10 @@ class TunnelServer:
                 if read_task in done:
                     try:
                         msg = read_task.result()
-                    except Exception:
+                        print(f"[DEBUG] Read completed: msg={type(msg).__name__ if msg else 'None'}")
+                    except Exception as read_ex:
                         # Read failed, exit loop
+                        print(f"[DEBUG] Read failed with exception: {read_ex}")
                         break
                     finally:
                         read_task = None  # Will start new read on next iteration
@@ -291,7 +296,9 @@ class TunnelServer:
                         # Stream is closing or no more messages
                         async with self._stream_lock:
                             num_streams = len(self._streams)
+                        print(f"[DEBUG] msg is None, num_streams={num_streams}")
                         if num_streams == 0:
+                            print("[DEBUG] Exiting loop: no streams and msg is None")
                             break
                         continue
 
