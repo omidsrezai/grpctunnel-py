@@ -102,6 +102,9 @@ class TunnelServer:
         self._last_seen = -1
         self._stream_lock = asyncio.Lock()
         self._is_closing = False
+        # Write queue to serialize all writes through the main loop
+        # This prevents concurrent read/write operations on the gRPC stream
+        self._write_queue: asyncio.Queue[ServerToClient] = asyncio.Queue()
 
     def register_method(
         self,
@@ -193,6 +196,16 @@ class TunnelServer:
         """Mark the server as shutting down."""
         self._is_closing = True
 
+    async def enqueue_write(self, msg: ServerToClient) -> None:
+        """
+        Enqueue a message to be written to the tunnel stream.
+
+        This method is safe to call from any coroutine. The message will be
+        written by the main serve_tunnel loop, ensuring no concurrent
+        read/write operations on the gRPC stream.
+        """
+        await self._write_queue.put(msg)
+
     async def serve_tunnel(
         self,
         stream: grpc.aio.StreamStreamCall[ClientToServer, ServerToClient],
@@ -220,54 +233,109 @@ class TunnelServer:
             # Send settings and wait for it to be written
             await stream.write(settings_msg)
 
-        # Main receive loop - use read() instead of async for to handle stream closing
+        # Main receive loop - uses a persistent read task to avoid cancellation issues
+        # Writes are processed when read completes or when signaled via write_event
+        read_task: Optional[asyncio.Task] = None
+        write_event = asyncio.Event()
+
+        # Patch enqueue_write to signal when writes are available
+        original_enqueue = self.enqueue_write
+        async def signaling_enqueue(msg: ServerToClient) -> None:
+            await original_enqueue(msg)
+            write_event.set()
+        self.enqueue_write = signaling_enqueue  # type: ignore
+
         try:
             while not self._is_closing:
-                # Try to read next message
-                msg = await stream.read() if hasattr(stream, 'read') else await stream.__anext__()
+                # Start a read task if we don't have one
+                if read_task is None:
+                    read_coro = stream.read() if hasattr(stream, 'read') else stream.__anext__()
+                    read_task = asyncio.create_task(read_coro)
 
-                if msg is None:
-                    # Stream is closing or no more messages
-                    # Wait a bit and check if we should exit
-                    async with self._stream_lock:
-                        num_streams = len(self._streams)
-                    # If there are no active streams, we can exit
-                    if num_streams == 0:
+                # Wait for either read to complete or writes to be available
+                write_wait_task = asyncio.create_task(write_event.wait())
+                done, _ = await asyncio.wait(
+                    [read_task, write_wait_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                # Cancel the write_wait_task if still pending
+                if write_wait_task not in done:
+                    write_wait_task.cancel()
+                    try:
+                        await write_wait_task
+                    except asyncio.CancelledError:
+                        pass
+
+                # Process any pending writes (non-blocking)
+                if write_event.is_set():
+                    write_event.clear()
+                    while not self._write_queue.empty():
+                        try:
+                            write_msg = self._write_queue.get_nowait()
+                            await stream.write(write_msg)
+                        except asyncio.QueueEmpty:
+                            break
+
+                # Process read result if available
+                if read_task in done:
+                    try:
+                        msg = read_task.result()
+                    except Exception:
+                        # Read failed, exit loop
                         break
-                    # Otherwise wait a bit and continue
-                    await asyncio.sleep(0.05)
-                    continue
+                    finally:
+                        read_task = None  # Will start new read on next iteration
 
-                # Handle NewStream messages - create new stream
-                if msg.HasField("new_stream"):
-                    ok, err = await self._create_stream(stream, msg.stream_id, msg.new_stream)
-                    if not ok:
-                        # Protocol error - abort tunnel
-                        raise Exception(f"Protocol error: {err}")
-                    if err is not None:
-                        # Stream error - send close but keep tunnel alive
-                        close_msg = ServerToClient(
-                            stream_id=msg.stream_id,
-                            close_stream={
-                                "status": _error_to_status(err),
-                            },
-                        )
-                        asyncio.create_task(stream.write(close_msg))
-                    continue
+                    if msg is None:
+                        # Stream is closing or no more messages
+                        async with self._stream_lock:
+                            num_streams = len(self._streams)
+                        if num_streams == 0:
+                            break
+                        continue
 
-                # Route message to appropriate stream
-                target_stream = await self._get_stream(msg.stream_id)
-                if target_stream is not None:
-                    await target_stream._accept_client_frame(msg)
+                    # Handle NewStream messages - create new stream
+                    if msg.HasField("new_stream"):
+                        ok, err = await self._create_stream(stream, msg.stream_id, msg.new_stream)
+                        if not ok:
+                            raise Exception(f"Protocol error: {err}")
+                        if err is not None:
+                            close_msg = ServerToClient(
+                                stream_id=msg.stream_id,
+                                close_stream={
+                                    "status": _error_to_status(err),
+                                },
+                            )
+                            await self.enqueue_write(close_msg)
+                        continue
+
+                    # Route message to appropriate stream
+                    target_stream = await self._get_stream(msg.stream_id)
+                    if target_stream is not None:
+                        await target_stream._accept_client_frame(msg)
 
         except asyncio.CancelledError:
-            # Clean shutdown
-            pass
+            # Clean shutdown - cancel pending read and flush writes
+            if read_task is not None:
+                read_task.cancel()
+                try:
+                    await read_task
+                except asyncio.CancelledError:
+                    pass
+            while not self._write_queue.empty():
+                try:
+                    write_msg = self._write_queue.get_nowait()
+                    await stream.write(write_msg)
+                except (asyncio.QueueEmpty, Exception):
+                    break
         except Exception as e:
-            # Log or handle error
             import traceback
             traceback.print_exc()
             raise
+        finally:
+            # Restore original enqueue_write
+            self.enqueue_write = original_enqueue  # type: ignore
 
     async def _create_stream(
         self,
@@ -337,7 +405,7 @@ class TunnelServer:
             # Parse request headers metadata
             headers = from_proto(new_stream_msg.request_headers)
 
-            # Create sender for this stream
+            # Create sender for this stream - uses enqueue_write to avoid concurrent ops
             async def send_func(data: bytes, total_size: int, first: bool) -> None:
                 if first:
                     msg = ServerToClient(
@@ -349,7 +417,7 @@ class TunnelServer:
                         stream_id=stream_id,
                         more_response_data=data,
                     )
-                await tunnel_stream.write(msg)
+                await self.enqueue_write(msg)
 
             # Create sender and receiver based on protocol revision
             if no_flow_control:
@@ -359,13 +427,13 @@ class TunnelServer:
 
                 def send_window_update(window: int) -> None:
                     # Don't send window updates if stream is half-closed
-                    # Note: server_stream doesn't exist yet, so we'll check in the async task
+                    # Enqueue the write to be processed by the main loop
                     async def do_send() -> None:
                         msg = ServerToClient(
                             stream_id=stream_id,
                             window_update=window,
                         )
-                        await tunnel_stream.write(msg)
+                        await self.enqueue_write(msg)
 
                     asyncio.create_task(do_send())
 
@@ -702,7 +770,7 @@ class TunnelServerStream:
             stream_id=self._stream_id,
             response_headers=headers_proto,
         )
-        await self._tunnel_stream.write(msg)
+        await self._server.enqueue_write(msg)
         self._sent_headers = True
         self._response_headers = None
 
@@ -752,14 +820,14 @@ class TunnelServerStream:
             headers = self._response_headers if send_headers else None
             trailers = self._response_trailers
 
-            # Send close message (don't block)
+            # Send close message via server's write queue to avoid concurrent ops
             async def send_close() -> None:
                 if send_headers and headers is not None:
                     headers_msg = ServerToClient(
                         stream_id=self._stream_id,
                         response_headers=to_proto(headers),
                     )
-                    await self._tunnel_stream.write(headers_msg)
+                    await self._server.enqueue_write(headers_msg)
 
                 close_msg = ServerToClient(
                     stream_id=self._stream_id,
@@ -768,7 +836,7 @@ class TunnelServerStream:
                         "response_trailers": to_proto(trailers),
                     },
                 )
-                await self._tunnel_stream.write(close_msg)
+                await self._server.enqueue_write(close_msg)
 
             asyncio.create_task(send_close())
 
