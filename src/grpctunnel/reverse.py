@@ -373,18 +373,15 @@ class ReverseTunnelServer:
         try:
             resp_metadata = await stream.initial_metadata()
         except Exception as e:
-            print(f"[DEBUG] Failed to get initial_metadata: {e}")
             return False, e
 
         # Check if server supports settings negotiation
         client_accepts_settings = False
-        print(f"[DEBUG] Response metadata: {list(resp_metadata) if resp_metadata else 'None'}")
         if resp_metadata:
             for key, value in resp_metadata:
                 if key == "grpctunnel-negotiate" and value == "on":
                     client_accepts_settings = True
                     break
-        print(f"[DEBUG] client_accepts_settings: {client_accepts_settings}")
 
         # Track this instance
         current_task = asyncio.current_task()
