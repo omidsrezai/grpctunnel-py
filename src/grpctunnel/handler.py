@@ -483,6 +483,9 @@ class TunnelServiceHandler:
             if self._options.on_reverse_tunnel_close:
                 self._options.on_reverse_tunnel_close(tunnel_channel)  # type: ignore
 
+            # Close the tunnel channel to stop its internal send/recv loops
+            await tunnel_channel.close_async()
+
             adapter.close()
 
 

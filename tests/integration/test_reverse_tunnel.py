@@ -449,19 +449,14 @@ class TestReverseTunnel:
             except asyncio.TimeoutError:
                 pytest.fail("Reverse tunnel did not complete")
 
-    @pytest.mark.skip(
-        reason="Concurrent reverse RPCs expose stream cleanup race condition - needs investigation"
-    )
     @pytest.mark.asyncio
     async def test_concurrent_reverse_rpcs(self, tunnel_server_with_reverse):
         """Test concurrent reverse RPCs.
 
-        Note: This test is currently skipped due to a race condition in stream cleanup
-        when handling multiple concurrent reverse RPCs. The issue manifests as
-        'GRPC_CALL_ERROR_TOO_MANY_OPERATIONS' and 'RPC already finished' errors.
-
-        Single and sequential reverse RPCs work reliably. This is a known limitation
-        documented in docs/KNOWN_LIMITATIONS.md.
+        This test verifies that multiple concurrent RPCs can be handled over a
+        reverse tunnel. Previously this test was skipped due to a race condition
+        that caused 'GRPC_CALL_ERROR_TOO_MANY_OPERATIONS' errors, but the issue
+        has been fixed by serializing writes through a queue in the main loop.
         """
         server_addr, handler = tunnel_server_with_reverse
 

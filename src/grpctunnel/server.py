@@ -316,19 +316,21 @@ class TunnelServer:
                         await target_stream._accept_client_frame(msg)
 
         except asyncio.CancelledError:
-            # Clean shutdown - cancel pending read and flush writes
+            # Clean shutdown - cancel pending read task
             if read_task is not None:
                 read_task.cancel()
                 try:
                     await read_task
                 except asyncio.CancelledError:
                     pass
+            # Don't try to write to stream on cancellation - it may be closed
+            # Just discard any pending writes
             while not self._write_queue.empty():
                 try:
-                    write_msg = self._write_queue.get_nowait()
-                    await stream.write(write_msg)
-                except (asyncio.QueueEmpty, Exception):
+                    self._write_queue.get_nowait()
+                except asyncio.QueueEmpty:
                     break
+            raise  # Re-raise CancelledError to signal cancellation
         except Exception as e:
             import traceback
             traceback.print_exc()
