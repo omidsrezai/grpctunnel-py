@@ -26,6 +26,7 @@ https://github.com/jhump/grpctunnel
 """
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
@@ -53,6 +54,9 @@ from grpctunnel.proto.v1 import (
 
 # Initial window size for flow control (64KB)
 INITIAL_WINDOW_SIZE = 65536
+
+# Logger for this module
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -541,12 +545,110 @@ class TunnelServerStream:
         self._num_sent = 0
         self._read_err: Optional[Exception] = None
 
+        # Cancellation tracking
+        self._tunnel_stream_closed = False
+        self._cancellation_event = asyncio.Event()
+
         # Locks
         self._write_lock = asyncio.Lock()
         self._read_lock = asyncio.Lock()
 
         # Context for handler
         self._context = _ServerContext(self)
+
+        # Start stream monitor if done() method available
+        # (gRPC AsyncIO streams have done() method in newer versions)
+        if hasattr(self._tunnel_stream, 'done') and callable(getattr(self._tunnel_stream, 'done')):
+            self._monitor_task: Optional[asyncio.Task[None]] = asyncio.create_task(self._monitor_tunnel_stream())
+        else:
+            self._monitor_task = None
+            logger.debug(
+                f"Stream monitoring not available for stream {stream_id} "
+                "(gRPC stream doesn't support done() method)"
+            )
+
+    async def _monitor_tunnel_stream(self) -> None:
+        """
+        Monitor the tunnel stream for premature closure.
+
+        This runs as a background task and sets the cancellation event
+        if the underlying gRPC stream closes while we're still processing.
+        """
+        try:
+            # Wait for the underlying gRPC stream to complete
+            await self._tunnel_stream.done()
+
+            # If we reach here, the stream has closed
+            # Check if our tunnel stream is still processing
+            if not self._closed:
+                # Stream closed prematurely (client cancellation)
+                self._cancellation_event.set()
+                self._tunnel_stream_closed = True
+                logger.debug(
+                    f"Stream {self._stream_id} ({self._method_name}): "
+                    f"Detected client disconnection"
+                )
+        except Exception as e:
+            # Shouldn't normally happen, but log defensively
+            logger.debug(
+                f"Stream {self._stream_id}: Monitor task error: {e}",
+                exc_info=True
+            )
+
+    async def _safe_tunnel_write(
+        self,
+        msg: ServerToClient,
+        operation: str = "write"
+    ) -> bool:
+        """
+        Safely write to tunnel stream, handling closed streams gracefully.
+
+        This wrapper provides defense-in-depth:
+        1. Check cancellation flag (set by monitor or previous write failure)
+        2. Attempt write with try/except
+        3. Catch InvalidStateError and update flags
+        4. Log at appropriate level
+
+        Args:
+            msg: ServerToClient message to write
+            operation: Human-readable description for logging
+
+        Returns:
+            True if write succeeded, False if stream already closed
+        """
+        # Fast path: Already know stream is closed
+        if self._tunnel_stream_closed or self._cancellation_event.is_set():
+            logger.debug(
+                f"Stream {self._stream_id} ({self._method_name}): "
+                f"Skipping {operation}, client already disconnected"
+            )
+            return False
+
+        try:
+            await self._tunnel_stream.write(msg)
+            return True
+
+        except asyncio.InvalidStateError as e:
+            # Expected: Client cancelled/disconnected
+            # This is normal operation, log at DEBUG level
+            self._tunnel_stream_closed = True
+            self._cancellation_event.set()
+            logger.debug(
+                f"Stream {self._stream_id} ({self._method_name}): "
+                f"Cannot {operation}, client closed connection: {e}"
+            )
+            return False
+
+        except Exception as e:
+            # Unexpected error - log at ERROR level
+            self._tunnel_stream_closed = True
+            self._cancellation_event.set()
+            logger.error(
+                f"Stream {self._stream_id} ({self._method_name}): "
+                f"Unexpected error during {operation}: {e}",
+                exc_info=True
+            )
+            return False
 
     async def _accept_client_frame(self, msg: ClientToServer) -> None:
         """Accept and process a frame from the client."""
@@ -861,6 +963,48 @@ class _ServerContext:
     async def set_trailing_metadata(self, metadata: grpc.aio.Metadata) -> None:
         """Set trailing metadata (trailers)."""
         await self._stream.set_response_trailers(metadata)
+
+    def is_active(self) -> bool:
+        """
+        Check if the client connection is still active.
+
+        Returns:
+            True if client is connected, False if disconnected/cancelled
+
+        Example:
+            async def long_handler(request, context):
+                for i in range(1000):
+                    if not context.is_active():
+                        raise Exception("client disconnected")
+                    await process_item(i)
+                return response
+        """
+        return not self._stream._cancellation_event.is_set()
+
+    async def wait_for_cancellation(self) -> None:
+        """
+        Wait until the client disconnects.
+
+        This can be used with asyncio.wait() to race handler execution
+        against client disconnection.
+
+        Example:
+            async def handler(request, context):
+                work_task = asyncio.create_task(do_work())
+                cancel_task = asyncio.create_task(context.wait_for_cancellation())
+
+                done, pending = await asyncio.wait(
+                    {work_task, cancel_task},
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+
+                if cancel_task in done:
+                    work_task.cancel()
+                    raise Exception("client disconnected")
+
+                return await work_task
+        """
+        await self._stream._cancellation_event.wait()
 
 
 def _error_to_status(err: Optional[Exception]) -> status_pb2.Status:
